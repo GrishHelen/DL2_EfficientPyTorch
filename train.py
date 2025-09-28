@@ -16,7 +16,7 @@ class TromptCell(nn.Module):
         super().__init__()
         # Embeddings (Figure 3.2)
         self.feature_emb_weight = nn.Parameter(torch.empty(n_columns, d_model))
-        self.feature_emb_bias = nn.Parameter(torch.empty(n_columns, d_model))
+        self.feature_emb_bias = nn.Parameter(torch.empty(1, n_columns, d_model))
         self.ln_emb = nn.LayerNorm(d_model)
 
         # Importance Getter (Figure 3.1)
@@ -41,26 +41,34 @@ class TromptCell(nn.Module):
         nn.init.normal_(self.emb_prompt, std=0.01)
 
     def forward(self, x: torch.Tensor, prev_cell_out: torch.Tensor) -> torch.Tensor:
-        x_emb = x.unsqueeze(
-            -1
-        ) * self.feature_emb_weight + self.feature_emb_bias.unsqueeze(0)
-        x_emb = F.relu(x_emb)
-        x_emb = self.ln_emb(x_emb)
+        # Convert inputs to float16
+        x = x.half()
+        prev_cell_out = prev_cell_out.half()
 
-        x_prompt = self.emb_prompt.unsqueeze(0).repeat(x_emb.shape[0], 1, 1)
+        # Convert parameters to float16 for this forward pass
+        feature_emb_weight = self.feature_emb_weight.half()
+        feature_emb_bias = self.feature_emb_bias.half()
+        emb_prompt = self.emb_prompt.half()
+        emb_column = self.emb_column.half()
+        dense_expand_weight = self.dense_expand.weight.half()
+        dense_expand_bias = self.dense_expand.bias.half()
+
+        x_emb = x.unsqueeze(-1) * feature_emb_weight + feature_emb_bias
+        x_emb = self.ln_emb(F.relu(x_emb, inplace=True))
+
+        x_prompt = emb_prompt
         x_prompt = (
             self.dense_imp(torch.cat([self.ln_prompt(x_prompt), prev_cell_out], dim=-1))
             + x_prompt
         )
-        x_column = self.ln_col(
-            self.emb_column.unsqueeze(0).repeat(x_emb.shape[0], 1, 1)
-        )
-        mask = torch.softmax(x_prompt @ x_column.transpose(1, 2), dim=-1)
+        x_column = self.ln_col(emb_column)
+        mask = torch.softmax(x_prompt @ x_column.transpose(0, 1), dim=-1)
 
-        x_emb = x_emb.unsqueeze(1) + self.dense_expand(x_emb.unsqueeze(-1)).permute(
-            0, 3, 1, 2
-        )
-        x_out = (mask.unsqueeze(-1) * x_emb).sum(dim=2)
+        x_out = torch.einsum("pc,bcd->bpd", mask, x_emb)
+        x_out = x_out + torch.einsum("pc,bcd,pa->bpd", mask, x_emb, dense_expand_weight)
+        x_out = x_out + torch.einsum("pc,p->p", mask, dense_expand_bias).unsqueeze(
+            -1
+        ).unsqueeze(0)
         return x_out
 
 
@@ -73,9 +81,21 @@ class TromptDownstream(nn.Module):
         self.dense_out = nn.Linear(d_model, 1)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        pw = torch.softmax(self.dense0(x).squeeze(-1), dim=-1)
-        xnew = (pw.unsqueeze(-1) * x).sum(dim=-2)
-        return self.dense_out(self.ln(F.relu(self.dense1(xnew))))
+        # Convert to float16
+        x = x.half()
+        dense0_weight = self.dense0.weight.half()
+        dense0_bias = self.dense0.bias.half()
+        dense1_weight = self.dense1.weight.half()
+        dense1_bias = self.dense1.bias.half()
+        dense_out_weight = self.dense_out.weight.half()
+        dense_out_bias = self.dense_out.bias.half()
+
+        # Use the converted parameters
+        pw = torch.softmax(F.linear(x, dense0_weight, dense0_bias).squeeze(-1), dim=-1)
+        xnew = torch.einsum("bcp,bcpd->bcd", pw, x)
+        xnew = F.relu(F.linear(xnew, dense1_weight, dense1_bias))
+        xnew = self.ln(xnew)
+        return F.linear(xnew, dense_out_weight, dense_out_bias).squeeze(-1)
 
 
 class Trompt(nn.Module):
@@ -92,11 +112,12 @@ class Trompt(nn.Module):
         nn.init.normal_(self.prompt, std=0.01)
 
     def forward(self, x):
-        x_prompt = self.prompt.unsqueeze(0).repeat(x.shape[0], 1, 1)
+        x_prompt = self.prompt.half()  # Convert prompt to float16
         outputs = []
         for cell in self.tcells:
-            outputs.append(self.tdown(cell(x, x_prompt)))
-        return torch.stack(outputs, dim=1).squeeze(-1)
+            outputs.append(cell(x, x_prompt))
+        outputs = torch.stack(outputs, dim=1)
+        return self.tdown(outputs)
 
 
 def load_from_url(url, cache_dir="."):
@@ -137,11 +158,12 @@ if __name__ == "__main__":
         d_model=128,
         n_cycles=6,
     )
-    device = torch.device("cuda:0")
+    device = torch.device("cuda")
+    model = nn.DataParallel(model, device_ids=[0, 1])
     model.to(device)
 
     train_dl = torch.utils.data.DataLoader(
-        train_dataset, num_workers=0, batch_size=8, shuffle=True
+        train_dataset, num_workers=0, batch_size=240, shuffle=True
     )
     val_dl = torch.utils.data.DataLoader(val_dataset, num_workers=0, batch_size=1024)
     optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4, weight_decay=1e-5)
@@ -153,10 +175,9 @@ if __name__ == "__main__":
         for batch in tqdm(train_dl):
             x, y = batch
             optimizer.zero_grad()
-            pred = model(x.to(device))
-            loss = F.mse_loss(
-                pred, y.unsqueeze(1).repeat(1, len(model.tcells)).to(device)
-            )
+            # Convert input to float16
+            pred = model(x.to(device).half())
+            loss = torch.mean(torch.square(pred - y.to(device).half()[:, None]))
             loss.backward()
             optimizer.step()
 
@@ -165,9 +186,11 @@ if __name__ == "__main__":
         with torch.inference_mode():
             for batch in val_dl:
                 x, y = batch
-                pred = model(x.to(device))
+                # Convert input to float16
+                pred = model(x.to(device).half())
+                # Convert back to float32 for MAE calculation to maintain precision
                 mae += (
-                    (pred.mean(dim=-1) * Y_std + Y_mean - y.to(device))
+                    (pred.mean(dim=-1).float() * Y_std + Y_mean - y.to(device))
                     .abs()
                     .sum()
                     .item()
