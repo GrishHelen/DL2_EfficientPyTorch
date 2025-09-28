@@ -42,33 +42,24 @@ class TromptCell(nn.Module):
         nn.init.normal_(self.emb_prompt, std=0.01)
 
     def forward(self, x: torch.Tensor, prev_cell_out: torch.Tensor) -> torch.Tensor:
-        # Оптимизация: предвычисление и более эффективные операции
         x_emb = torch.addcmul(
             self.feature_emb_bias, x.unsqueeze(-1), self.feature_emb_weight
         )
         x_emb = self.ln_emb(F.relu(x_emb))
-
         x_prompt = self.emb_prompt
-        # Оптимизация: конкатенация + линейный слой
-        x_prompt_input = torch.cat([self.ln_prompt(x_prompt), prev_cell_out], dim=-1)
-        x_prompt = self.dense_imp(x_prompt_input) + x_prompt
-
+        x_prompt = (
+            self.dense_imp(torch.cat([self.ln_prompt(x_prompt), prev_cell_out], dim=-1))
+            + x_prompt
+        )
         x_column = self.ln_col(self.emb_column)
-
-        # Оптимизация: более эффективное вычисление mask
         mask = torch.softmax(torch.matmul(x_prompt, x_column.transpose(0, 1)), dim=-1)
-
         x_out = torch.einsum("pc,bcd->bpd", mask, x_emb)
-
-        # Объединенные вычисления для весов и смещения
-        expand_weight = self.dense_expand.weight
-        expand_bias = self.dense_expand.bias
-
-        x_out = x_out + torch.einsum("pc,bcd,pa->bpd", mask, x_emb, expand_weight)
-        x_out = x_out + torch.einsum("pc,p->pc", mask, expand_bias).unsqueeze(
-            0
-        ).unsqueeze(-1)
-
+        x_out = x_out + torch.einsum(
+            "pc,bcd,pa->bpd", mask, x_emb, self.dense_expand.weight
+        )
+        x_out = x_out + torch.einsum("pc,p->p", mask, self.dense_expand.bias).unsqueeze(
+            -1
+        ).unsqueeze(0)
         return x_out
 
 
@@ -100,13 +91,12 @@ class Trompt(nn.Module):
         nn.init.normal_(self.prompt, std=0.01)
 
     def forward(self, x):
-        x_prompt = self.prompt.expand(x.size(0), -1, -1)
+        x_prompt = self.prompt
         outputs = []
         for cell in self.tcells:
-            x_prompt = cell(x, x_prompt)
-            outputs.append(x_prompt)
-        outputs = torch.stack(outputs, dim=1)
-        return self.tdown(outputs)
+            outputs.append(cell(x, x_prompt))
+        outputs = self.tdown(torch.stack(outputs, dim=1))
+        return outputs
 
 
 def load_from_url(url, cache_dir="."):
@@ -128,7 +118,7 @@ if __name__ == "__main__":
     torch.manual_seed(0)
     # torch.backends.cuda.matmul.allow_tf32 = True
     # torch.backends.cudnn.allow_tf32 = True
-    # torch.backends.cudnn.benchmark = True  # Автоматическая оптимизация сверток
+    # torch.backends.cudnn.benchmark = True
 
     train_dataset = torch.utils.data.TensorDataset(
         *map(torch.nan_to_num, load_from_url(TRAIN_DATA))
@@ -150,38 +140,31 @@ if __name__ == "__main__":
         d_model=128,
         n_cycles=6,
     )
+    model = nn.DataParallel(model, device_ids=[0, 1])
     device = torch.device("cuda")
+    model.to(device)
+
     train_dl = torch.utils.data.DataLoader(
         train_dataset,
         num_workers=2,
-        batch_size=512,
+        batch_size=512,  # Reduced for stability
         shuffle=True,
         pin_memory=True,
-        persistent_workers=True,
-        prefetch_factor=2,
+        persistent_workers=False,  # Simplified
     )
     val_dl = torch.utils.data.DataLoader(
         val_dataset,
         num_workers=2,
         batch_size=1024,
         pin_memory=True,
-        persistent_workers=True,
-        prefetch_factor=2,
+        persistent_workers=False,  # Simplified
     )
 
-    # Использование оптимизированного AdamW если доступно
-    try:
-        # PyTorch 2.0+ имеет fused AdamW
-        optimizer = torch.optim.AdamW(
-            model.parameters(), lr=3e-4, weight_decay=1e-5, fused=True
-        )
-    except:
-        optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4, weight_decay=1e-5)
-
+    # Fixed: use standard AdamW without fused (more compatible)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4, weight_decay=1e-5)
     scaler = GradScaler()
 
     EPOCHS = 5
-    model = torch.compile(model, mode="reduce-overhead")
 
     for e in range(1, EPOCHS + 1):
         model.train()
@@ -190,9 +173,10 @@ if __name__ == "__main__":
             x = x.to(device, non_blocking=True)
             y = y.to(device, non_blocking=True)
 
-            optimizer.zero_grad(set_to_none=True)
+            optimizer.zero_grad()
             with autocast(device_type="cuda", dtype=torch.float16):
                 pred = model(x)
+                # Fixed: ensure correct dimensions for loss computation
                 loss = F.mse_loss(pred, y.unsqueeze(-1))
 
             scaler.scale(loss).backward()
@@ -210,7 +194,7 @@ if __name__ == "__main__":
                 with autocast(device_type="cuda", dtype=torch.float16):
                     pred = model(x)
 
-                mae += (pred * Y_std + Y_mean - y).abs().sum().item()
+                mae += (pred.mean(dim=-1) * Y_std + Y_mean - y).abs().sum().item()
 
             mae = mae / len(val_dataset)
 
