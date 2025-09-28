@@ -5,6 +5,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.utils.data
+from torch.amp import autocast, GradScaler
 
 import os
 import urllib.request
@@ -145,6 +146,7 @@ if __name__ == "__main__":
     )
     val_dl = torch.utils.data.DataLoader(val_dataset, num_workers=0, batch_size=1024)
     optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4, weight_decay=1e-5)
+    scaler = GradScaler()
 
     EPOCHS = 5
 
@@ -152,24 +154,31 @@ if __name__ == "__main__":
         model.train()
         for batch in tqdm(train_dl):
             x, y = batch
+            x = x.to(device)
+            y = y.to(device)
+
             optimizer.zero_grad()
-            pred = model(x.to(device))
-            loss = torch.mean(torch.square(pred - y.to(device)[:, None]))
-            loss.backward()
-            optimizer.step()
+            with autocast():
+                pred = model(x)
+                loss = torch.mean(torch.square(pred - y[:, None]))
+
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
 
         model.eval()
         mae = 0
         with torch.inference_mode():
             for batch in val_dl:
                 x, y = batch
-                pred = model(x.to(device))
-                mae += (
-                    (pred.mean(dim=-1) * Y_std + Y_mean - y.to(device))
-                    .abs()
-                    .sum()
-                    .item()
-                )
+                x = x.to(device)
+                y = y.to(device)
+
+                # Use AMP for validation
+                with autocast():
+                    pred = model(x)
+
+                mae += (pred.mean(dim=-1) * Y_std + Y_mean - y).abs().sum().item()
 
             mae = mae / len(val_dataset)
 
