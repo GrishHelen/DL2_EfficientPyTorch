@@ -41,32 +41,22 @@ class TromptCell(nn.Module):
         nn.init.normal_(self.emb_prompt, std=0.01)
 
     def forward(self, x: torch.Tensor, prev_cell_out: torch.Tensor) -> torch.Tensor:
-        # Convert inputs to float16
-        x = x.half()
-        prev_cell_out = prev_cell_out.half()
-
-        # Convert parameters to float16 for this forward pass
-        feature_emb_weight = self.feature_emb_weight.half()
-        feature_emb_bias = self.feature_emb_bias.half()
-        emb_prompt = self.emb_prompt.half()
-        emb_column = self.emb_column.half()
-        dense_expand_weight = self.dense_expand.weight.half()
-        dense_expand_bias = self.dense_expand.bias.half()
-
-        x_emb = x.unsqueeze(-1) * feature_emb_weight + feature_emb_bias
+        x_emb = x.unsqueeze(-1) * self.feature_emb_weight + self.feature_emb_bias
         x_emb = self.ln_emb(F.relu(x_emb, inplace=True))
 
-        x_prompt = emb_prompt
+        x_prompt = self.emb_prompt
         x_prompt = (
             self.dense_imp(torch.cat([self.ln_prompt(x_prompt), prev_cell_out], dim=-1))
             + x_prompt
         )
-        x_column = self.ln_col(emb_column)
+        x_column = self.ln_col(self.emb_column)
         mask = torch.softmax(x_prompt @ x_column.transpose(0, 1), dim=-1)
 
         x_out = torch.einsum("pc,bcd->bpd", mask, x_emb)
-        x_out = x_out + torch.einsum("pc,bcd,pa->bpd", mask, x_emb, dense_expand_weight)
-        x_out = x_out + torch.einsum("pc,p->p", mask, dense_expand_bias).unsqueeze(
+        x_out = x_out + torch.einsum(
+            "pc,bcd,pa->bpd", mask, x_emb, self.dense_expand.weight
+        )
+        x_out = x_out + torch.einsum("pc,p->p", mask, self.dense_expand.bias).unsqueeze(
             -1
         ).unsqueeze(0)
         return x_out
@@ -81,21 +71,9 @@ class TromptDownstream(nn.Module):
         self.dense_out = nn.Linear(d_model, 1)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # Convert to float16
-        x = x.half()
-        dense0_weight = self.dense0.weight.half()
-        dense0_bias = self.dense0.bias.half()
-        dense1_weight = self.dense1.weight.half()
-        dense1_bias = self.dense1.bias.half()
-        dense_out_weight = self.dense_out.weight.half()
-        dense_out_bias = self.dense_out.bias.half()
-
-        # Use the converted parameters
-        pw = torch.softmax(F.linear(x, dense0_weight, dense0_bias).squeeze(-1), dim=-1)
+        pw = torch.softmax(self.dense0(x).squeeze(-1), dim=-1)
         xnew = torch.einsum("bcp,bcpd->bcd", pw, x)
-        xnew = F.relu(F.linear(xnew, dense1_weight, dense1_bias))
-        xnew = self.ln(xnew)
-        return F.linear(xnew, dense_out_weight, dense_out_bias).squeeze(-1)
+        return self.dense_out(self.ln(F.relu(self.dense1(xnew)))).squeeze(-1)
 
 
 class Trompt(nn.Module):
@@ -112,12 +90,12 @@ class Trompt(nn.Module):
         nn.init.normal_(self.prompt, std=0.01)
 
     def forward(self, x):
-        x_prompt = self.prompt.half()  # Convert prompt to float16
+        x_prompt = self.prompt
         outputs = []
         for cell in self.tcells:
             outputs.append(cell(x, x_prompt))
-        outputs = torch.stack(outputs, dim=1)
-        return self.tdown(outputs)
+        outputs = self.tdown(torch.stack(outputs, dim=1))
+        return outputs
 
 
 def load_from_url(url, cache_dir="."):
@@ -175,9 +153,8 @@ if __name__ == "__main__":
         for batch in tqdm(train_dl):
             x, y = batch
             optimizer.zero_grad()
-            # Convert input to float16
-            pred = model(x.to(device).half())
-            loss = torch.mean(torch.square(pred - y.to(device).half()[:, None]))
+            pred = model(x.to(device))
+            loss = torch.mean(torch.square(pred - y.to(device)[:, None]))
             loss.backward()
             optimizer.step()
 
@@ -186,11 +163,9 @@ if __name__ == "__main__":
         with torch.inference_mode():
             for batch in val_dl:
                 x, y = batch
-                # Convert input to float16
-                pred = model(x.to(device).half())
-                # Convert back to float32 for MAE calculation to maintain precision
+                pred = model(x.to(device))
                 mae += (
-                    (pred.mean(dim=-1).float() * Y_std + Y_mean - y.to(device))
+                    (pred.mean(dim=-1) * Y_std + Y_mean - y.to(device))
                     .abs()
                     .sum()
                     .item()
