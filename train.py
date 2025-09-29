@@ -116,9 +116,7 @@ VAL_DATA = "https://huggingface.co/datasets/puhsu/hw01-data/resolve/main/val_dat
 
 if __name__ == "__main__":
     torch.manual_seed(0)
-    # torch.backends.cuda.matmul.allow_tf32 = True
-    # torch.backends.cudnn.allow_tf32 = True
-    # torch.backends.cudnn.benchmark = True
+    torch.backends.cudnn.benchmark = True
 
     train_dataset = torch.utils.data.TensorDataset(
         *map(torch.nan_to_num, load_from_url(TRAIN_DATA))
@@ -140,9 +138,9 @@ if __name__ == "__main__":
         d_model=128,
         n_cycles=6,
     )
-    model = nn.DataParallel(model, device_ids=[0, 1])
     device = torch.device("cuda")
     model.to(device)
+    model = torch.compile(model, mode="reduce-overhead", fullgraph=True)
 
     train_dl = torch.utils.data.DataLoader(
         train_dataset,
@@ -150,14 +148,14 @@ if __name__ == "__main__":
         batch_size=512,  # Reduced for stability
         shuffle=True,
         pin_memory=True,
-        persistent_workers=False,  # Simplified
+        persistent_workers=False,
     )
     val_dl = torch.utils.data.DataLoader(
         val_dataset,
         num_workers=2,
         batch_size=1024,
         pin_memory=True,
-        persistent_workers=False,  # Simplified
+        persistent_workers=False,
     )
 
     # Fixed: use standard AdamW without fused (more compatible)
