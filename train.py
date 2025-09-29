@@ -163,7 +163,6 @@ if __name__ == "__main__":
     scaler = GradScaler()
 
     EPOCHS = 5
-
     for e in range(1, EPOCHS + 1):
         model.train()
         for batch in tqdm(train_dl):
@@ -175,7 +174,7 @@ if __name__ == "__main__":
             with autocast(device_type="cuda", dtype=torch.float16):
                 pred = model(x)
                 # Fixed: ensure correct dimensions for loss computation
-                loss = F.mse_loss(pred, y.unsqueeze(-1))
+                loss = torch.mean(torch.square(pred - y[:, None]))
 
             scaler.scale(loss).backward()
             scaler.step(optimizer)
